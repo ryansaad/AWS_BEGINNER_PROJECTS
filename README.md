@@ -6,19 +6,19 @@ This repository contains a collection of hands-on projects I have completed to b
 
 ## Projects Overview
 
-1.  **[Basic WordPress Server on EC2](./01-Basic-WordPress-EC2/README.md)**
+1.  **Basic WordPress Server on EC2**
     * A foundational project to deploy a monolithic WordPress application on a single EC2 instance with a local database.
 
-2.  **[AWS CLI S3 Manipulation](./02-AWS-CLI-S3/README.md)**
+2.  **AWS CLI S3 Manipulation**
     * A practical exercise in using the AWS Command Line Interface (CLI) to manage S3 buckets and objects programmatically.
 
-3.  **[EC2 Instance Backup and Restore](./03-EC2-Backup-Restore/README.md)**
+3.  **EC2 Instance Backup and Restore**
     * A disaster recovery simulation demonstrating how to create an Amazon Machine Image (AMI) from a running instance and restore it.
 
-4.  **[Advanced WordPress Architecture](./04-Advanced-WordPress-VPC/README.md)**
+4.  **Advanced WordPress Architecture**
     * A highly available and secure two-tier WordPress deployment featuring a custom VPC, private subnets for the EC2 instance and RDS database, and an Application Load Balancer.
 
-5.  **[Auto-Scaling Nginx Web Application](./05-Auto-Scaling-Nginx/README.md)**
+5.  **Auto-Scaling Nginx Web Application**
     * A resilient and elastic web application environment that automatically scales EC2 instances based on CPU load, managed by an Auto Scaling Group.
 
 ---
