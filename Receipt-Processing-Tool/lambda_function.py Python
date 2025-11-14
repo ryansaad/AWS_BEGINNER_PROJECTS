@@ -1,0 +1,199 @@
+import json
+import os
+import boto3
+from datetime import datetime
+import uuid
+import re # Import regex for more robust parsing
+
+# Initialize AWS service clients
+s3 = boto3.client('s3')
+textract = boto3.client('textract')
+dynamodb = boto3.resource('dynamodb')
+ses = boto3.client('ses')
+
+# Environment variables (configured in Lambda function settings)
+DYNAMODB_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME')
+SES_SENDER_EMAIL = os.environ.get('SES_SENDER_EMAIL')
+SES_RECIPIENT_EMAIL = os.environ.get('SES_RECIPIENT_EMAIL')
+
+# Initialize DynamoDB table resource
+table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+
+def extract_total_amount(lines):
+    """
+    Attempts to extract the total amount from a list of text lines.
+    This is a basic example and might need refinement for different receipt formats.
+    It looks for keywords like "total" and then attempts to find a numeric value.
+    """
+    total_keywords = ["total", "balance", "amount due", "grand total", "total due", "subtotal"]
+    currency_symbols = r'\$€£¥₹' # Common currency symbols
+
+    # Regex to find numbers that could be totals (e.g., 12.34, 123.00, $12.34, 1,234.56)
+    # This regex is an improvement but still might not catch all cases
+    total_regex = re.compile(r'({}?\s*\d{{1,3}}(?:[,\s]\d{{3}})*(?:\.\d{{2}})?)\b'.format(currency_symbols), re.IGNORECASE)
+
+    # Search from bottom up, as totals are often at the end of receipts
+    for line in reversed(lines):
+        line_lower = line.lower()
+        
+        # Prioritize lines containing common total keywords
+        if any(keyword in line_lower for keyword in total_keywords):
+            match = total_regex.search(line)
+            if match:
+                # Clean the matched total (remove currency symbols, thousands commas, extra spaces)
+                total = match.group(1).replace('$', '').replace('€', '').replace('£', '').replace(',', '').strip()
+                try:
+                    # Validate that it's a number before returning
+                    float(total)
+                    return total
+                except ValueError:
+                    continue # Not a valid number, keep searching
+
+    # Fallback: if no keyword match, try to find the last numeric value that looks like a total
+    for line in reversed(lines):
+        match = total_regex.search(line)
+        if match:
+            total = match.group(1).replace('$', '').replace('€', '').replace('£', '').replace(',', '').strip()
+            try:
+                float(total)
+                return total
+            except ValueError:
+                continue
+                
+    return "N/A" # Return N/A if no total found
+
+def extract_date(lines):
+    """
+    Attempts to extract a date from a list of text lines.
+    This is a basic example and might need refinement for different date formats.
+    """
+    # Common date formats to look for
+    date_patterns = [
+        r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',  # MM/DD/YY, DD/MM/YY, MM-DD-YYYY, etc.
+        r'\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b',    # YYYY-MM-DD
+        r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2},\s+\d{4}\b', # Mon DD, YYYY (e.g., Jan 01, 2023)
+        r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4}\b', # DD Mon YYYY (e.g., 01 Jan 2023)
+    ]
+
+    for line in lines:
+        for pattern in date_patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                # Basic parsing, more robust parsing might require dateutil.parser
+                return match.group(0)
+    
+    # Default to current date if no clear date is found
+    return datetime.now().strftime("%Y-%m-%d")
+
+def lambda_handler(event, context):
+    print("Received event: " + json.dumps(event, indent=2))
+
+    # Get the S3 bucket and object key from the event
+    if not event['Records']:
+        print("No S3 event records found in the event. Exiting.")
+        return {
+            'statusCode': 400,
+            'body': json.dumps('No S3 event records found.')
+        }
+
+    bucket_name = event['Records'][0]['s3']['bucket']['name']
+    object_key = event['Records'][0]['s3']['object']['key']
+
+    print(f"Processing object: '{object_key}' from bucket: '{bucket_name}'")
+
+    try:
+        # Ensure the object is in the 'incoming/' folder
+        if not object_key.startswith('incoming/'):
+            print(f"Ignoring object '{object_key}' as it's not in the 'incoming/' folder.")
+            return {
+                'statusCode': 200,
+                'body': json.dumps('Not an incoming receipt, ignoring.')
+            }
+
+        # Use Textract to detect text from the uploaded image
+        # Using detect_document_text for general text extraction
+        textract_response = textract.detect_document_text(
+            Document={
+                'S3Object': {
+                    'Bucket': bucket_name,
+                    'Name': object_key
+                }
+            }
+        )
+
+        extracted_text_lines = []
+        for item in textract_response['Blocks']:
+            if item['BlockType'] == 'LINE' and 'Text' in item:
+                extracted_text_lines.append(item['Text'])
+        
+        full_extracted_text = "\n".join(extracted_text_lines)
+        print("--- Extracted Text ---")
+        print(full_extracted_text)
+        print("----------------------")
+
+        # Extract relevant information using helper functions
+        receipt_total = extract_total_amount(extracted_text_lines)
+        receipt_date = extract_date(extracted_text_lines)
+
+        # Generate a unique receipt ID
+        receipt_id = str(uuid.uuid4())
+
+        # Store data in DynamoDB
+        item_to_store = {
+            'ReceiptID': receipt_id,
+            'FileName': object_key.split('/')[-1], # Store just the filename, not full path
+            'BucketName': bucket_name,
+            'ExtractedText': full_extracted_text,
+            'TotalAmount': receipt_total,
+            'Date': receipt_date,
+            'ProcessingTimestamp': datetime.now().isoformat()
+        }
+        
+        # Add a conditional put to prevent overwriting if ReceiptID somehow collides (highly unlikely with UUID)
+        table.put_item(Item=item_to_store)
+        print(f"Successfully stored item in DynamoDB: {json.dumps(item_to_store, indent=2)}")
+
+        # Prepare and send email summary using SES
+        email_subject = f'Receipt Processed: {item_to_store["FileName"]}'
+        email_body_text = f"""
+Hello,
+
+A new receipt has been processed successfully by your automated tool!
+
+**Receipt Details:**
+- **File Name:** {item_to_store["FileName"]}
+- **Extracted Total:** {receipt_total}
+- **Extracted Date:** {receipt_date}
+- **Receipt ID:** {receipt_id}
+
+You can view the full details and all extracted text in your DynamoDB table.
+
+Best regards,
+Your Automated Receipt Processor
+"""
+
+        try:
+            ses.send_email(
+                Source=SES_SENDER_EMAIL,
+                Destination={'ToAddresses': [SES_RECIPIENT_EMAIL]},
+                Message={
+                    'Subject': {'Data': email_subject},
+                    'Body': {'Text': {'Data': email_body_text}}
+                }
+            )
+            print("Email sent successfully!")
+        except Exception as ses_e:
+            print(f"ERROR: Could not send SES email. Please check SES sender/recipient setup and permissions: {ses_e}")
+            # Continue execution even if email fails, as data is already in DynamoDB
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Receipt processed and summary sent!')
+        }
+
+    except Exception as e:
+        print(f"An unexpected error occurred during receipt processing: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error processing receipt: {str(e)}")
+        }
